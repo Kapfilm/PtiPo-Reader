@@ -39,11 +39,18 @@ void EpubReaderChapterSelectionActivity::onEnter() {
 void EpubReaderChapterSelectionActivity::onExit() { Activity::onExit(); }
 
 void EpubReaderChapterSelectionActivity::loop() {
-  const int pageItems = getPageItems();
   const int totalItems = getTotalItems();
 
   ButtonEventManager::ButtonEvent ev;
   while (buttonEvents.consumeEvent(ev)) {
+    // Only Up/Down: PageBack/PageForward are aliases emitted for the same press.
+    if (ev.type == ButtonEventManager::PressType::Short && totalItems > 0 &&
+        (ev.button == MappedInputManager::Button::Up || ev.button == MappedInputManager::Button::Down)) {
+      const int delta = ev.button == MappedInputManager::Button::Down ? 5 : -5;
+      selectorIndex = std::clamp(selectorIndex + delta, 0, totalItems - 1);
+      requestUpdate();
+      continue;
+    }
     if (ev.button == MappedInputManager::Button::Confirm && ev.type == ButtonEventManager::PressType::Short) {
       const auto newSpineIndex = epub->getSpineIndexForTocIndex(selectorIndex);
       if (newSpineIndex == -1) {
@@ -66,8 +73,10 @@ void EpubReaderChapterSelectionActivity::loop() {
     }
   }
 
-  buttonNavigator.onNextList(selectorIndex, totalItems, [this] { requestUpdate(); });
-  buttonNavigator.onPreviousList(selectorIndex, totalItems, [this] { requestUpdate(); });
+  buttonNavigator.onNextList({MappedInputManager::Button::Right}, selectorIndex, totalItems,
+                             [this] { requestUpdate(); });
+  buttonNavigator.onPreviousList({MappedInputManager::Button::Left}, selectorIndex, totalItems,
+                                 [this] { requestUpdate(); });
 }
 
 void EpubReaderChapterSelectionActivity::render(RenderLock&&) {

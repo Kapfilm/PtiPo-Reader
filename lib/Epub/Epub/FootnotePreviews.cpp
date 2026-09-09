@@ -18,7 +18,7 @@
 namespace {
 
 constexpr uint32_t CACHE_MAGIC = 0x31504E46;  // "FNP1"
-constexpr uint16_t CACHE_VERSION = 1;
+constexpr uint16_t CACHE_VERSION = 2;
 constexpr size_t STREAM_CHUNK_BYTES = 1024;
 constexpr size_t MAX_HREF_BYTES = 191;
 constexpr size_t MAX_MARKER_BYTES = 15;
@@ -162,10 +162,12 @@ class LinkScanner {
     const bool qualifies = self->linkIsNoteref_ || (!self->textOverflow_ && isMarkerText(self->text_, self->textLen_));
     if (qualifies && self->targets_.size() < FootnotePreviews::MAX_ENTRIES) {
       const char* hash = strchr(self->href_, '#');
-      const char* fragment = hash + 1;  // '#' presence checked at startElement
+      const std::string decodedFragment = FsHelpers::decodeUriEscapes(hash + 1);
+      const char* fragment = decodedFragment.c_str();  // '#' presence checked at startElement
       if (*fragment != '\0') {
-        const int targetSpine =
-            self->href_[0] == '#' ? self->spineIndex_ : self->epub_.resolveHrefToSpineIndex(self->href_);
+        const int targetSpine = self->href_[0] == '#'
+                                    ? self->spineIndex_
+                                    : self->epub_.resolveHrefToSpineIndex(self->href_, self->spineIndex_);
         if (targetSpine >= 0) {
           const uint32_t keyHash = makeKeyHash(targetSpine, fragment);
           const bool seen = std::any_of(self->targets_.begin(), self->targets_.end(),
@@ -323,7 +325,20 @@ bool streamSpineEntry(ZipFile& zip, const std::string& href, uint8_t* chunk, Con
 
 namespace FootnotePreviews {
 
-bool cacheExists(const std::string& bookCachePath) { return Storage.exists((bookCachePath + CACHE_FILENAME).c_str()); }
+bool cacheExists(const std::string& bookCachePath) {
+  FsFile file;
+  if (!Storage.openFileForRead("FNP", bookCachePath + CACHE_FILENAME, file)) return false;
+  uint32_t magic = 0, offset = 0;
+  uint16_t version = 0, count = 0;
+  serialization::readPod(file, magic);
+  serialization::readPod(file, version);
+  serialization::readPod(file, count);
+  serialization::readPod(file, offset);
+  const bool valid = magic == CACHE_MAGIC && version == CACHE_VERSION && count <= MAX_ENTRIES && offset >= 12 &&
+                     offset <= file.size() && file.size() - offset == count * 8UL;
+  file.close();
+  return valid;
+}
 
 bool gather(Epub& epub, const std::function<void(int)>& progressFn) {
   const std::string cachePath = epub.getCachePath() + CACHE_FILENAME;
@@ -472,10 +487,10 @@ bool Lookup::find(const char* href, std::string& outText) {
   int targetSpine = currentSpineIndex_;
   if (href[0] != '#') {
     if (!epub_) return false;
-    targetSpine = epub_->resolveHrefToSpineIndex(href);
+    targetSpine = epub_->resolveHrefToSpineIndex(href, currentSpineIndex_);
     if (targetSpine < 0) return false;
   }
-  const uint32_t keyHash = makeKeyHash(targetSpine, hash + 1);
+  const uint32_t keyHash = makeKeyHash(targetSpine, FsHelpers::decodeUriEscapes(hash + 1).c_str());
 
   int lo = 0, hi = entryCount_ - 1;
   uint32_t blobOffset = 0;

@@ -227,7 +227,7 @@ class Epub {
   void persistImageManifest() {
     if (imageManifest) imageManifest->persistIfDirty();
   }
-  int resolveHrefToSpineIndex(const std::string& href) const;
+  int resolveHrefToSpineIndex(const std::string& href, int sourceSpineIndex = -1) const;
 
   // Printed-page list (from NCX <pageList> / EPUB 3 nav page-list / EPUB 2.01 page-map.xml).
   // One entry per printed-page anchor: spine href + fragment id + visible label.

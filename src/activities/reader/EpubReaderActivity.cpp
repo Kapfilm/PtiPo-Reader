@@ -44,6 +44,7 @@
 #include "EpubReaderPercentSelectionActivity.h"
 #include "EpubReaderPrintedPageInputActivity.h"
 #include "FinishedBookActivity.h"
+#include "FootnoteMenuActivity.h"
 #include "GlobalBookmarkIndex.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderDocumentId.h"
@@ -52,6 +53,7 @@
 #include "QuickOverridesActivity.h"
 #include "ReaderActivity.h"
 #include "ReaderUtils.h"
+#include "ReadingProfilesActivity.h"
 #include "ReadingSessionTracker.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontGlobals.h"
@@ -567,7 +569,7 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  if (automaticPageTurnActive) {
+  if (footnoteHistory.empty() && automaticPageTurnActive) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
         mappedInput.wasReleased(MappedInputManager::Button::Back)) {
       buttonEvents.drain();
@@ -625,7 +627,7 @@ void EpubReaderActivity::loop() {
         return;
       }
       if (ev.type == ButtonEventManager::PressType::Short) {
-        if (footnoteDepth > 0) {
+        if (!footnoteHistory.empty()) {
           restoreSavedPosition();
           return;
         }
@@ -851,7 +853,7 @@ Section::BuildParams EpubReaderActivity::makeSectionBuildParams() const {
   p.fontSizeNormalization = getEffectiveFontSizeNormalization();
   p.embeddedStyle = lastRenderStats.embeddedStyle;
   p.bionicReadingEnabled = getEffectiveBionicReading();
-  p.inlineFootnotePreviews = pendingFootnotePreviewAnchor.empty() && getEffectiveInlineFootnotePreviews();
+  p.inlineFootnotePreviews = footnoteHistory.empty() && getEffectiveInlineFootnotePreviews();
   p.imageRendering = lastRenderStats.imageRendering;
   p.fontSizeLadder = buildReaderFontSizeLadder(p.fontId);
   p.previewAnchor = pendingFootnotePreviewAnchor;
@@ -982,7 +984,7 @@ void EpubReaderActivity::endBackgroundBorrow() {
 }
 
 void EpubReaderActivity::stepBackgroundSectionBuild() {
-  if (!epub || !section || readerPhase_ != ReaderPhase::READING || activeFootnotePreview ||
+  if (!epub || !section || readerPhase_ != ReaderPhase::READING || !footnoteHistory.empty() ||
       !pendingFootnotePreviewAnchor.empty()) {
     return;
   }
@@ -1520,28 +1522,20 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           });
       break;
     }
-    case EpubReaderMenuActivity::MenuAction::FOOTNOTES: {
-      // Opportunistic: when the book-level footnote cache exists (gathered for inline
-      // previews), show each entry's note text in the list. Purely passive — no cache,
-      // plain marker list as before; opening the list never triggers a gather.
-      std::vector<std::string> footnotePreviews(currentPageFootnotes.size());
-      FootnotePreviews::Lookup previewLookup;
-      if (previewLookup.open(epub->getCachePath(), epub.get(), currentSpineIndex)) {
-        for (size_t i = 0; i < currentPageFootnotes.size(); ++i) {
-          previewLookup.find(currentPageFootnotes[i].href, footnotePreviews[i]);
-        }
-      }
+    case EpubReaderMenuActivity::MenuAction::READING_PROFILES:
       startActivityForResult(
-          std::make_unique<EpubReaderFootnotesActivity>(renderer, mappedInput, currentPageFootnotes,
-                                                        std::move(footnotePreviews), rememberedFootnoteIndex()),
-          [this](const ActivityResult& result) {
-            rememberFootnoteIndex(result);
-            if (!result.isCancelled) {
-              const auto& footnoteResult = std::get<FootnoteResult>(result.data);
-              navigateToHref(footnoteResult.href, true);
-            }
-            requestUpdate();
+          std::make_unique<ReadingProfilesActivity>(renderer, mappedInput), [this](const ActivityResult& result) {
+            if (result.isCancelled || !std::holds_alternative<MenuResult>(result.data)) return;
+            const auto& profile = std::get<MenuResult>(result.data);
+            applyBookReaderOverrides(bookEmbeddedStyleOverride, bookImageRenderingOverride, bookFontFamilyOverride,
+                                     bookSdFontFamilyOverride, profile.fontSizeOverride, bookBionicReadingOverride,
+                                     bookParagraphAlignmentOverride, bookTextAntiAliasingOverride,
+                                     bookHyphenationOverride, bookFontSizeNormalizationOverride, bookGuideDotsOverride,
+                                     bookInlineFootnotePreviewsOverride, profile.lineHeightPercentOverride);
           });
+      break;
+    case EpubReaderMenuActivity::MenuAction::FOOTNOTES: {
+      openFootnotes();
       break;
     }
     case EpubReaderMenuActivity::MenuAction::GO_TO_PERCENT: {
@@ -2259,6 +2253,26 @@ void EpubReaderActivity::anchorNavTargetToCurrentPage() {
 }
 
 bool EpubReaderActivity::stepPageState(const bool isForwardTurn) {
+  {
+    RenderLock lock(*this);
+    if (!epub || !section) return false;
+    // A note never changes chapters, including while its full text is being built.
+    if (!footnoteHistory.empty()) {
+      if (section->hasActiveBuild() && navTarget.kind != NavigationTarget::Kind::Page) return false;
+      const int available = section->hasActiveBuild() ? section->activeBuildPageCount() : section->pageCount;
+      if (isForwardTurn && section->currentPage + 1 < available)
+        ++section->currentPage;
+      else if (!isForwardTurn && section->currentPage > 0)
+        --section->currentPage;
+      else
+        return false;
+      anchorNavTargetToCurrentPage();
+      lastPageTurnTime = millis();
+      forceLoadLargeImages = false;
+      pageHasPlaceholders = false;
+      return true;
+    }
+  }
   if (!epub || !section) {
     return false;
   }
@@ -2316,22 +2330,6 @@ bool EpubReaderActivity::stepPageState(const bool isForwardTurn) {
   // a visible "out of bounds" frame. The forward mirror can double-advance past the end.
   RenderLock lock(*this);
 
-  // A targeted footnote preview is a small standalone view, not a real chapter
-  // position. Page within its three-page window but never cross into adjacent spines.
-  if (activeFootnotePreview) {
-    if (isForwardTurn && section->currentPage < section->pageCount - 1) {
-      section->currentPage++;
-    } else if (!isForwardTurn && section->currentPage > 0) {
-      section->currentPage--;
-    } else {
-      return false;
-    }
-    lastPageTurnTime = millis();
-    forceLoadLargeImages = false;
-    pageHasPlaceholders = false;
-    return true;
-  }
-
   // A 0-page section (permanently unparse-able chapter) has no within-chapter navigation,
   // but the user must still be able to cross spine boundaries to escape it.
   const bool hasPages = section->pageCount > 0;
@@ -2375,6 +2373,16 @@ bool EpubReaderActivity::stepPageState(const bool isForwardTurn) {
 }
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
+  bool atNoteEnd = false;
+  {
+    RenderLock lock(*this);
+    atNoteEnd = isForwardTurn && !footnoteHistory.empty() && section && !section->hasActiveBuild() &&
+                section->currentPage + 1 >= section->pageCount;
+  }
+  if (atNoteEnd) {
+    openFootnoteMenu();
+    return;
+  }
   // Cancel any pending deferred AA pass — it belongs to the page we're leaving.
   pendingGrayscale_ = {};
 
@@ -2442,8 +2450,10 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
       if (!stepPageState(isForwardTurn)) {
         return;
       }
-      sessionPagesAdvanced++;
-      globalReadingSessionTracker().onPageTurn();
+      if (footnoteHistory.empty()) {
+        sessionPagesAdvanced++;
+        globalReadingSessionTracker().onPageTurn();
+      }
       preRenderedPage.ready = false;
       pendingPreRender = false;
       requestUpdate();
@@ -2466,8 +2476,10 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
     anchorNavTargetToCurrentPage();
     preRenderedPage.ready = false;
     usePreRenderedBuffer = true;
-    sessionPagesAdvanced++;
-    globalReadingSessionTracker().onPageTurn();
+    if (footnoteHistory.empty()) {
+      sessionPagesAdvanced++;
+      globalReadingSessionTracker().onPageTurn();
+    }
     lastPageTurnTime = millis();
     requestUpdate();
     return;
@@ -2485,8 +2497,10 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
           pageTurnStatsWindow.turns, expectedNextPage);
   logPageTurnWindowIfReady();
 
-  sessionPagesAdvanced++;
-  globalReadingSessionTracker().onPageTurn();
+  if (footnoteHistory.empty()) {
+    sessionPagesAdvanced++;
+    globalReadingSessionTracker().onPageTurn();
+  }
   // Page state advanced without using a pre-render. Drop any pre-render that was
   // scheduled for the page we just left: otherwise the coalesced render() would
   // classify as a PreRender pass and try to pre-render the *new* current page's
@@ -2647,6 +2661,20 @@ EpubReaderActivity::RenderLayout EpubReaderActivity::computeRenderLayout() const
   int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
   renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
                                    &orientedMarginLeft);
+  if (!footnoteHistory.empty()) {
+    const Rect content = UITheme::getContentRect(renderer, true, false);
+    RenderLayout layout;
+    // The front-button hint strip rotates with the device; reserve its actual edge.
+    layout.marginTop = std::max(orientedMarginTop, content.y) + 32;
+    layout.marginLeft = std::max(orientedMarginLeft, content.x) + SETTINGS.screenMargin;
+    layout.marginRight =
+        std::max(orientedMarginRight, renderer.getScreenWidth() - content.x - content.width) + SETTINGS.screenMargin;
+    layout.marginBottom =
+        std::max(orientedMarginBottom, renderer.getScreenHeight() - content.y - content.height) + SETTINGS.screenMargin;
+    layout.viewportWidth = renderer.getScreenWidth() - layout.marginLeft - layout.marginRight;
+    layout.viewportHeight = renderer.getScreenHeight() - layout.marginTop - layout.marginBottom;
+    return layout;
+  }
   const int statusBarTopHeight = UITheme::getStatusBarTopHeight(automaticPageTurnActive);
   const int statusBarBottomHeight = UITheme::getStatusBarBottomHeight(automaticPageTurnActive);
 
@@ -2811,8 +2839,7 @@ void EpubReaderActivity::renderPreRenderPass(const RenderLayout& layout) {
     // framebuffer resident (no visible refresh or baseline change) and decline
     // under pressure rather than disturbing the foreground reader.
     const bool forceLoad = forceLoadLargeImages || !SETTINGS.largeImagePlaceholder;
-    if (p->hasUncachedImages(forceLoad, /*monochromeOutput=*/true) &&
-        !CooperativeAbort::shouldAbortLongTask()) {
+    if (p->hasUncachedImages(forceLoad, /*monochromeOutput=*/true) && !CooperativeAbort::shouldAbortLongTask()) {
       const uint32_t warmFree = esp_get_free_heap_size();
       const uint32_t warmContig = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
       if (warmFree >= BG_IMAGE_WARM_MIN_FREE_HEAP_BYTES && warmContig >= BG_IMAGE_WARM_MIN_CONTIG_HEAP_BYTES) {
@@ -2822,17 +2849,17 @@ void EpubReaderActivity::renderPreRenderPass(const RenderLayout& layout) {
         imageProcessingActive_ = true;
         const unsigned long warmStart = millis();
         const bool attempted = p->warmFirstImageCache(renderer, layout.marginLeft, contentTop, forceLoad,
-                                                       /*monochromeOutput=*/true);
+                                                      /*monochromeOutput=*/true);
         const bool aborted = CooperativeAbort::consumeAborted();
         imageProcessingActive_ = false;
         renderer.clearScreen();  // decoder output is scratch; only its .pxc cache is retained
         if (attempted) {
-          LOG_DBG("ERS", "Background image warm page=%d %s in %lums", nextPage,
-                  aborted ? "cancelled" : "finished", millis() - warmStart);
+          LOG_DBG("ERS", "Background image warm page=%d %s in %lums", nextPage, aborted ? "cancelled" : "finished",
+                  millis() - warmStart);
         }
       } else {
-        LOG_DBG("ERS", "Background image warm skipped: free=%lu contig=%lu",
-                static_cast<unsigned long>(warmFree), static_cast<unsigned long>(warmContig));
+        LOG_DBG("ERS", "Background image warm skipped: free=%lu contig=%lu", static_cast<unsigned long>(warmFree),
+                static_cast<unsigned long>(warmContig));
       }
     }
   }
@@ -3115,7 +3142,7 @@ bool EpubReaderActivity::buildSection(const RenderLayout& layout) {
 
   // Preview text is baked into laid-out pages. Prepare its book-level source before
   // probing the preview-enabled section variant so a cache hit can never bypass gather.
-  if (getEffectiveInlineFootnotePreviews()) {
+  if (footnoteHistory.empty() && getEffectiveInlineFootnotePreviews()) {
     ensureFootnotePreviewCache();
   }
 
@@ -3316,16 +3343,8 @@ bool EpubReaderActivity::buildSection(const RenderLayout& layout) {
       renderer.restoreFontMetadata();
       readerPhase_ = ReaderPhase::READING;
       if (outcome == BuildOutcome::Failed) {
-        if (buildingFootnotePreview && footnoteDepth > 0) {
-          footnoteDepth--;
-          const SavedPosition origin = savedPositions[footnoteDepth];
-          LOG_ERR("ERS", "Targeted footnote preview failed; restoring spine %d page %d", origin.spineIndex,
-                  origin.pageNumber);
-          pendingFootnotePreviewAnchor.clear();
-          activeFootnotePreview = false;
-          currentSpineIndex = origin.spineIndex;
-          navTarget = NavigationTarget::makePage(origin.pageNumber);
-          section.reset();
+        if (buildingFootnotePreview && !footnoteHistory.empty()) {
+          restoreNotePosition(std::move(*footnoteHistory.pop()));
           requestUpdate();
           return false;
         }
@@ -3370,7 +3389,6 @@ bool EpubReaderActivity::buildSection(const RenderLayout& layout) {
   LOG_DBG("ERS", "resolveInto result: currentPage=%d", (int)section->currentPage);
   anchorNavTargetToCurrentPage();
   activeFootnotePreview = buildingFootnotePreview;
-  pendingFootnotePreviewAnchor.clear();
   forceLoadLargeImages = false;
   pageHasPlaceholders = false;
   return true;
@@ -3419,8 +3437,8 @@ void EpubReaderActivity::renderNormalPass(RenderLock& lock, const RenderLayout& 
       automaticPageTurnActive = false;
 
       if (pageLoadFailStage_ == 1) {
-        LOG_ERR("ERS", "Page %d load failed (spine %d, free=%lu); evicting caches and retrying",
-                section->currentPage, currentSpineIndex, static_cast<unsigned long>(esp_get_free_heap_size()));
+        LOG_ERR("ERS", "Page %d load failed (spine %d, free=%lu); evicting caches and retrying", section->currentPage,
+                currentSpineIndex, static_cast<unsigned long>(esp_get_free_heap_size()));
         if (FontCacheManager* fontCache = renderer.getFontCacheManager()) {
           fontCache->clearCache();
         }
@@ -3434,8 +3452,8 @@ void EpubReaderActivity::renderNormalPass(RenderLock& lock, const RenderLayout& 
       }
 
       if (pageLoadFailStage_ == 2) {
-        LOG_ERR("ERS", "Page %d load failed again (spine %d, free=%lu); rebuilding section cache",
-                section->currentPage, currentSpineIndex, static_cast<unsigned long>(esp_get_free_heap_size()));
+        LOG_ERR("ERS", "Page %d load failed again (spine %d, free=%lu); rebuilding section cache", section->currentPage,
+                currentSpineIndex, static_cast<unsigned long>(esp_get_free_heap_size()));
         section->clearCache();
         section.reset();
         requestUpdate();
@@ -3484,7 +3502,7 @@ void EpubReaderActivity::renderNormalPass(RenderLock& lock, const RenderLayout& 
       return;
     }
 
-    if (!activeFootnotePreview) {
+    if (footnoteHistory.empty()) {
       pendingProgressSave.spineIndex = currentSpineIndex;
       pendingProgressSave.page = section->currentPage;
       pendingProgressSave.pageCount = section->pageCount;
@@ -3755,6 +3773,7 @@ bool EpubReaderActivity::writeReaderProgressCache(const std::string& cachePath, 
 }
 
 void EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
+  if (!footnoteHistory.empty()) return;
   const uint8_t percent = epubProgressPercentByte(*epub, spineIndex, currentPage, pageCount);
   if (!writeReaderProgressCache(epub->getCachePath(), spineIndex, currentPage, pageCount, percent)) {
     LOG_ERR("ERS", "Could not save progress!");
@@ -4230,27 +4249,31 @@ void EpubReaderActivity::restoreCurrentPageToBufferIfPreRendered() {
     return;
   }
 
-  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
-  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
-                                   &orientedMarginLeft);
-  const int statusBarTopHeight = UITheme::getStatusBarTopHeight(automaticPageTurnActive);
-  const int statusBarBottomHeight = UITheme::getStatusBarBottomHeight(automaticPageTurnActive);
-  orientedMarginTop += std::max(static_cast<int>(SETTINGS.screenMargin), statusBarTopHeight);
-  orientedMarginLeft += SETTINGS.screenMargin;
-  orientedMarginRight += SETTINGS.screenMargin;
-  orientedMarginBottom += std::max(static_cast<int>(SETTINGS.screenMargin), statusBarBottomHeight);
+  const RenderLayout layout = computeRenderLayout();
 
   auto p = section->loadPageFromSectionFile();
   if (!p) {
     return;
   }
-  renderPageContentOnly(*p, orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
+  renderPageContentOnly(*p, layout.marginTop, layout.marginRight, layout.marginBottom, layout.marginLeft);
   preRenderedPage.ready = false;
   pendingPreRender = false;
   usePreRenderedBuffer = false;
 }
 
 void EpubReaderActivity::renderStatusBar() const {
+  if (!footnoteHistory.empty()) {
+    const auto layout = computeRenderLayout();
+    char title[160];
+    const char* label =
+        footnoteHistory.size() == 1 && !originFootnotes_.empty() ? originFootnotes_[originFootnoteIndex_].number : "";
+    snprintf(title, sizeof(title), "%s %s  %d/%d", tr(STR_FOOTNOTES), label, section ? section->currentPage + 1 : 0,
+             section ? section->pageCount : 0);
+    renderer.drawCenteredText(UI_10_FONT_ID, layout.marginTop - 30, title);
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_MENU), tr(STR_PREV_PAGE), tr(STR_NEXT_PAGE));
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    return;
+  }
   // Calculate progress in book. During an active section build pageCount only reflects pages
   // built so far, not the final chapter length, so show a byte-based estimate ("page X of ~Y")
   // instead of the misleading watermark. estimatedTotalPages() returns 0 while it's still too
@@ -4357,7 +4380,8 @@ void EpubReaderActivity::renderBackgroundDebugOverlay() const {
 }
 
 bool EpubReaderActivity::shouldSkipPeriodicUpdate() const {
-  if (lastStatusBarPage < 0) return false;  // no baseline yet — let the first render happen
+  if (!footnoteHistory.empty()) return true;  // Note chrome has no ticking clock/battery.
+  if (lastStatusBarPage < 0) return false;    // no baseline yet — let the first render happen
   const int currentPage = section ? section->currentPage + 1 : -1;
   if (currentPage != lastStatusBarPage) return false;
   if (SETTINGS.statusBarBattery) {
@@ -4371,56 +4395,139 @@ bool EpubReaderActivity::shouldSkipPeriodicUpdate() const {
   return true;
 }
 
+void EpubReaderActivity::resetNoteRenderState() {
+  currentPageFootnotes.clear();
+  pendingPreRender = false;
+  usePreRenderedBuffer = false;
+  preRenderedPage.ready = false;
+  pendingGrayscale_ = {};
+  pendingProgressSave.pending.store(false, std::memory_order_release);
+  resetBackgroundBuild();
+  forceLoadLargeImages = false;
+  pageHasPlaceholders = false;
+}
+
 void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool savePosition) {
-  if (!epub) return;
-
-  // Push current position onto saved stack
-  if (savePosition && section && footnoteDepth < MAX_FOOTNOTE_DEPTH) {
-    savedPositions[footnoteDepth] = {currentSpineIndex, section->currentPage};
-    footnoteDepth++;
-    LOG_DBG("ERS", "Saved position [%d]: spine %d, page %d", footnoteDepth, currentSpineIndex, section->currentPage);
-  }
-
-  // Extract fragment anchor (e.g. "#note1" or "chapter2.xhtml#note1")
-  std::string anchor;
-  const auto hashPos = hrefStr.find('#');
-  if (hashPos != std::string::npos && hashPos + 1 < hrefStr.size()) {
-    // XHTML IDs are stored decoded in the section anchor map. Link fragments may
-    // still contain URI escapes (for example "#note%203"), so compare like with like.
-    anchor = FsHelpers::decodeUriEscapes(hrefStr.substr(hashPos + 1));
-  }
-
-  // Check for same-file anchor reference (#anchor only)
-  bool sameFile = !hrefStr.empty() && hrefStr[0] == '#';
-
-  int targetSpineIndex;
-  if (sameFile) {
-    targetSpineIndex = currentSpineIndex;
-  } else {
-    targetSpineIndex = epub->resolveHrefToSpineIndex(hrefStr);
-  }
-
-  if (targetSpineIndex < 0) {
-    LOG_DBG("ERS", "Could not resolve href: %s", hrefStr.c_str());
-    if (savePosition && footnoteDepth > 0) footnoteDepth--;  // undo push
+  RenderLock lock(*this);
+  if (!epub || !section) return;
+  const int target = epub->resolveHrefToSpineIndex(hrefStr, currentSpineIndex);
+  if (target < 0 || (savePosition && footnoteHistory.full())) {
+    GUI.drawPopup(renderer, target < 0 ? tr(STR_NOTE_LINK_UNAVAILABLE) : tr(STR_NOTE_HISTORY_FULL));
+    requestUpdate();
     return;
   }
-
-  // Same-spine links already have an anchor map in the loaded section, so rebuilding
-  // a separate preview wastes time and adds an avoidable e-ink refresh. Keep the
-  // bounded targeted build for cross-file notes, matching CrossInk's button flow.
-  const bool useTargetedPreview = savePosition && !anchor.empty() && targetSpineIndex != currentSpineIndex;
-
-  {
-    RenderLock lock(*this);
-    navTarget = anchor.empty() ? NavigationTarget::makePage(0) : NavigationTarget::makeAnchor(std::move(anchor));
-    pendingFootnotePreviewAnchor = useTargetedPreview ? navTarget.anchorStr : std::string{};
-    activeFootnotePreview = false;
-    currentSpineIndex = targetSpineIndex;
-    section.reset();
+  std::string anchor;
+  if (const auto hash = hrefStr.find('#'); hash != std::string::npos) {
+    anchor = FsHelpers::decodeUriEscapes(hrefStr.substr(hash + 1));
   }
+  if (savePosition) {
+    SavedPosition position;
+    position.spineIndex = currentSpineIndex;
+    position.pageNumber = section->currentPage;
+    position.pageCount = section->hasActiveBuild() ? 0 : section->pageCount;
+    position.paragraph = section->getParagraphIndexForPage(section->currentPage);
+    position.previewAnchor = pendingFootnotePreviewAnchor;
+    position.noteAnchor = footnoteAnchor_;
+    if (footnoteHistory.empty()) {
+      // Commit the source before changing any state: sleep/reboot in a note resumes the book.
+      saveProgress(currentSpineIndex, section->currentPage, position.pageCount);
+      originFootnotes_ = currentPageFootnotes;
+      for (int i = 0; i < static_cast<int>(originFootnotes_.size()); ++i) {
+        if (hrefStr == originFootnotes_[i].href) originFootnoteIndex_ = i;
+      }
+    }
+    footnoteHistory.push(std::move(position));
+  }
+  resetNoteRenderState();
+  footnoteAnchor_ = anchor;
+  pendingFootnotePreviewAnchor = savePosition ? anchor : std::string{};
+  activeFootnotePreview = false;
+  navTarget = anchor.empty() ? NavigationTarget::makePage(0) : NavigationTarget::makeAnchor(std::move(anchor));
+  currentSpineIndex = target;
+  section.reset();
   requestUpdate();
-  LOG_DBG("ERS", "Navigated to spine %d for href: %s", targetSpineIndex, hrefStr.c_str());
+}
+
+void EpubReaderActivity::openFootnotes() {
+  if (!epub || currentPageFootnotes.empty()) return;
+  if (currentPageFootnotes.size() == 1) {
+    navigateToHref(currentPageFootnotes.front().href, true);
+    return;
+  }
+  std::vector<std::string> previews(currentPageFootnotes.size());
+  FootnotePreviews::Lookup lookup;
+  if (lookup.open(epub->getCachePath(), epub.get(), currentSpineIndex)) {
+    for (size_t i = 0; i < currentPageFootnotes.size(); ++i) lookup.find(currentPageFootnotes[i].href, previews[i]);
+  }
+  startActivityForResult(std::make_unique<EpubReaderFootnotesActivity>(renderer, mappedInput, currentPageFootnotes,
+                                                                       std::move(previews), rememberedFootnoteIndex()),
+                         [this](const ActivityResult& result) {
+                           rememberFootnoteIndex(result);
+                           if (!result.isCancelled) navigateToHref(std::get<FootnoteResult>(result.data).href, true);
+                         });
+}
+
+void EpubReaderActivity::openFullFootnote() {
+  RenderLock lock(*this);
+  if (footnoteHistory.empty()) return;
+  resetNoteRenderState();
+  pendingFootnotePreviewAnchor.clear();
+  activeFootnotePreview = false;
+  navTarget = footnoteAnchor_.empty() ? NavigationTarget::makePage(0) : NavigationTarget::makeAnchor(footnoteAnchor_);
+  section.reset();
+  requestUpdate();
+}
+
+void EpubReaderActivity::switchFootnote(int delta) {
+  RenderLock lock(*this);
+  if (footnoteHistory.empty() || originFootnotes_.empty()) return;
+  const int index = std::clamp(originFootnoteIndex_ + delta, 0, static_cast<int>(originFootnotes_.size()) - 1);
+  if (index == originFootnoteIndex_ && footnoteHistory.size() == 1) return;
+  const std::string href = originFootnotes_[index].href;
+  const int target = epub->resolveHrefToSpineIndex(href, footnoteHistory.root().spineIndex);
+  if (target < 0) {
+    GUI.drawPopup(renderer, tr(STR_NOTE_LINK_UNAVAILABLE));
+    requestUpdate();
+    return;
+  }
+  footnoteHistory.keepRoot();
+  originFootnoteIndex_ = index;
+  resetNoteRenderState();
+  const auto hash = href.find('#');
+  footnoteAnchor_ = hash == std::string::npos ? "" : FsHelpers::decodeUriEscapes(href.substr(hash + 1));
+  pendingFootnotePreviewAnchor = footnoteAnchor_;
+  activeFootnotePreview = false;
+  currentSpineIndex = target;
+  navTarget = footnoteAnchor_.empty() ? NavigationTarget::makePage(0) : NavigationTarget::makeAnchor(footnoteAnchor_);
+  section.reset();
+  requestUpdate();
+}
+
+void EpubReaderActivity::openFootnoteMenu() {
+  startActivityForResult(
+      std::make_unique<FootnoteMenuActivity>(renderer, mappedInput, activeFootnotePreview,
+                                             !currentPageFootnotes.empty(), originFootnotes_.size() > 1),
+      [this](const ActivityResult& result) {
+        if (result.isCancelled || !std::holds_alternative<MenuResult>(result.data)) return;
+        switch (std::get<MenuResult>(result.data).action) {
+          case FootnoteMenuActivity::FULL_TEXT:
+            openFullFootnote();
+            break;
+          case FootnoteMenuActivity::LINKS:
+            openFootnotes();
+            break;
+          case FootnoteMenuActivity::PREVIOUS_NOTE:
+            switchFootnote(-1);
+            break;
+          case FootnoteMenuActivity::NEXT_NOTE:
+            switchFootnote(1);
+            break;
+          case FootnoteMenuActivity::RETURN_TO_BOOK:
+            footnoteHistory.keepRoot();
+            restoreSavedPosition();
+            break;
+        }
+      });
 }
 
 int EpubReaderActivity::rememberedFootnoteIndex() {
@@ -4442,21 +4549,32 @@ void EpubReaderActivity::rememberFootnoteIndex(const ActivityResult& result) {
   }
 }
 
-void EpubReaderActivity::restoreSavedPosition() {
-  if (footnoteDepth <= 0) return;
-  footnoteDepth--;
-  const auto& pos = savedPositions[footnoteDepth];
-  LOG_DBG("ERS", "Restoring position [%d]: spine %d, page %d", footnoteDepth, pos.spineIndex, pos.pageNumber);
-
-  {
-    RenderLock lock(*this);
-    pendingFootnotePreviewAnchor.clear();
-    activeFootnotePreview = false;
-    currentSpineIndex = pos.spineIndex;
-    navTarget = NavigationTarget::makePage(pos.pageNumber);
-    section.reset();
+void EpubReaderActivity::restoreNotePosition(SavedPosition pos) {
+  // Caller holds RenderLock (also used by the build-failure path on the render task).
+  resetNoteRenderState();
+  currentSpineIndex = pos.spineIndex;
+  pendingFootnotePreviewAnchor = std::move(pos.previewAnchor);
+  footnoteAnchor_ = std::move(pos.noteAnchor);
+  activeFootnotePreview = false;
+  navTarget = NavigationTarget::makePage(pos.pageNumber);
+  navTarget.cachedPageCount = pos.pageCount;
+  navTarget.cachedSpineIdx = pos.spineIndex;
+  lastPageTurnTime = millis();
+  section.reset();
+  if (footnoteHistory.empty()) {
+    footnoteListSpine_ = pos.spineIndex;
+    footnoteListPage_ = pos.pageNumber;
+    footnoteListSelectedIndex_ = originFootnoteIndex_;
+    std::vector<FootnoteEntry>().swap(originFootnotes_);
   }
-  requestUpdate();
+}
+
+void EpubReaderActivity::restoreSavedPosition() {
+  RenderLock lock(*this);
+  if (auto position = footnoteHistory.pop()) {
+    restoreNotePosition(std::move(*position));
+    requestUpdate();
+  }
 }
 
 bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, GfxRenderer& renderer) {
@@ -4959,6 +5077,10 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
 }
 
 void EpubReaderActivity::openReaderMenu() {
+  if (!footnoteHistory.empty()) {
+    openFootnoteMenu();
+    return;
+  }
   const int currentPage = section ? section->currentPage + 1 : 0;
   const int totalPages = section ? section->pageCount : 0;
 
@@ -5021,6 +5143,28 @@ void EpubReaderActivity::openReaderMenu() {
 
 void EpubReaderActivity::onButtonAction(const CrossPointSettings::BUTTON_ACTION action) {
   using BA = CrossPointSettings::BUTTON_ACTION;
+  if (!footnoteHistory.empty()) {
+    switch (action) {
+      case BA::BTN_PAGE_FORWARD:
+        pageTurn(true);
+        return;
+      case BA::BTN_PAGE_BACK:
+        pageTurn(false);
+        return;
+      case BA::BTN_FOOTNOTES:
+        openFootnotes();
+        return;
+      case BA::BTN_NEXT_SECTION:
+        switchFootnote(1);
+        return;
+      case BA::BTN_PREV_SECTION:
+        switchFootnote(-1);
+        return;
+      default:
+        openFootnoteMenu();
+        return;
+    }
+  }
   switch (action) {
     case BA::BTN_PAGE_FORWARD:
       pageTurn(true);
@@ -5047,22 +5191,7 @@ void EpubReaderActivity::onButtonAction(const CrossPointSettings::BUTTON_ACTION 
       }
       break;
     case BA::BTN_FOOTNOTES:
-      if (!currentPageFootnotes.empty()) {
-        if (currentPageFootnotes.size() == 1) {
-          navigateToHref(currentPageFootnotes[0].href, true);
-        } else {
-          startActivityForResult(
-              std::make_unique<EpubReaderFootnotesActivity>(renderer, mappedInput, currentPageFootnotes,
-                                                            std::vector<std::string>{}, rememberedFootnoteIndex()),
-              [this](const ActivityResult& result) {
-                rememberFootnoteIndex(result);
-                if (!result.isCancelled) {
-                  const auto& footnoteResult = std::get<FootnoteResult>(result.data);
-                  navigateToHref(footnoteResult.href, true);
-                }
-              });
-        }
-      }
+      openFootnotes();
       break;
     case BA::BTN_OPEN_TOC:
       if (epub) {

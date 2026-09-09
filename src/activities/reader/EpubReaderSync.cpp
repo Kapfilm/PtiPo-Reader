@@ -33,8 +33,9 @@ void EpubReaderActivity::launchKOReaderSync(const SyncLaunchMode mode) {
     return;
   }
 
-  const int currentPage = section ? section->currentPage : 0;
-  const int totalPages = section ? section->pageCount : 0;
+  const auto* origin = footnoteHistory.empty() ? nullptr : &footnoteHistory.root();
+  const int currentPage = origin ? origin->pageNumber : (section ? section->currentPage : 0);
+  const int totalPages = origin ? origin->pageCount : (section ? section->pageCount : 0);
   KOReaderSyncIntentState syncIntent = KOReaderSyncIntentState::COMPARE;
   if (mode == SyncLaunchMode::PULL_REMOTE) {
     syncIntent = KOReaderSyncIntentState::PULL_REMOTE;
@@ -47,11 +48,15 @@ void EpubReaderActivity::launchKOReaderSync(const SyncLaunchMode mode) {
   auto& sync = APP_STATE.koReaderSyncSession;
   sync.active = true;
   sync.epubPath = epub->getPath();
-  sync.spineIndex = currentSpineIndex;
+  sync.spineIndex = origin ? origin->spineIndex : currentSpineIndex;
   sync.page = currentPage;
   sync.totalPagesInSpine = totalPages;
   // Populate paragraph index and XHTML seek hint from section LUT if available.
-  if (section) {
+  if (origin) {
+    sync.paragraphIndex = origin->paragraph.value_or(0);
+    sync.hasParagraphIndex = origin->paragraph.has_value();
+    sync.xhtmlSeekHint = 0;
+  } else if (section) {
     if (const auto pIdx = section->getParagraphIndexForPage(static_cast<uint16_t>(currentPage))) {
       sync.paragraphIndex = *pIdx;
       sync.hasParagraphIndex = true;

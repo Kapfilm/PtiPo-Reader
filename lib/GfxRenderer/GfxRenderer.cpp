@@ -105,6 +105,13 @@ void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) {
   invalidateScaledGlyphCache();
 }
 
+void GfxRenderer::replaceFont(const int fontId, EpdFontFamily font) {
+  const auto entry = fontMap.find(fontId);
+  if (entry == fontMap.end()) return;
+  entry->second = font;
+  invalidateScaledGlyphCache();
+}
+
 // Bits needed for a w x h 1-bit mask, plus one guard byte: bitmapExtract() reads
 // two bytes when a chunk straddles a byte boundary, so the final chunk of the
 // last row may touch one byte past the packed size.

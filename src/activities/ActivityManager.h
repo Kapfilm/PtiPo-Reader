@@ -54,6 +54,7 @@ class ActivityManager {
 
  protected:
   GfxRenderer& renderer;
+  uint8_t uiFontStyleApplied = 0;
   MappedInputManager& mappedInput;
   ButtonEventManager& buttonEvents;
   std::vector<std::unique_ptr<Activity>> stackActivities;

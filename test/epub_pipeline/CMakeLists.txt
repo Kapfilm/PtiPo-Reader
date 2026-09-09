@@ -85,6 +85,7 @@ set(PIPELINE_INCLUDES
 
 add_executable(EpubPipelineTest
   EpubPipelineTest.cpp
+  FootnoteNavigationTest.cpp
   FingerprintTest.cpp
   ImageExtractionTest.cpp
   ${PIPELINE_SOURCES}

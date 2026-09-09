@@ -100,6 +100,7 @@ void EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes, bool hasStarredPa
   // --- Navigation ---
   menuItems.push_back(SettingInfo::Separator(StrId::STR_READER_NAVIGATION));
   menuItems.push_back(SettingInfo::Action(StrId::STR_SELECT_CHAPTER, SettingAction::None));
+  menuItems.push_back(SettingInfo::Action(StrId::STR_READING_PROFILES, SettingAction::None));
   menuItems.push_back(SettingInfo::Action(StrId::STR_GO_TO_PERCENT, SettingAction::None));
   if (hasPrintedPages) {
     menuItems.push_back(SettingInfo::Action(StrId::STR_GO_TO_PRINTED_PAGE, SettingAction::None));
@@ -394,6 +395,8 @@ void EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes, bool hasStarredPa
 
 EpubReaderMenuActivity::MenuAction EpubReaderMenuActivity::actionForNameId(StrId nameId) {
   switch (nameId) {
+    case StrId::STR_READING_PROFILES:
+      return MenuAction::READING_PROFILES;
     case StrId::STR_SELECT_CHAPTER:
       return MenuAction::SELECT_CHAPTER;
     case StrId::STR_GO_TO_PERCENT:

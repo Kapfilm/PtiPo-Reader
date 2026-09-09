@@ -1786,29 +1786,40 @@ std::optional<Epub::PrintedPageEntry> Epub::findPrintedPageByLabel(int target) c
   return match;
 }
 
-int Epub::resolveHrefToSpineIndex(const std::string& href) const {
+int Epub::resolveHrefToSpineIndex(const std::string& href, const int sourceSpineIndex) const {
   if (!bookMetadataCache || !bookMetadataCache->isLoaded()) return -1;
-
-  // Split before decoding so escaped '#' characters in filenames stay part of the path.
   const size_t hashPos = href.find('#');
-  const std::string rawTarget = hashPos != std::string::npos ? href.substr(0, hashPos) : href;
-  const std::string target = FsHelpers::normalisePath(FsHelpers::decodeUriEscapes(rawTarget));
-
-  // Same-file reference (anchor-only)
-  if (target.empty()) return -1;
-
-  // Extract just the filename for comparison
-  size_t targetSlash = target.find_last_of('/');
-  std::string targetFilename = (targetSlash != std::string::npos) ? target.substr(targetSlash + 1) : target;
-
-  for (int i = 0; i < getSpineItemsCount(); i++) {
-    const auto& spineHref = getSpineItem(i).href;
-    // Try exact match first
-    if (spineHref == target) return i;
-    // Then filename-only match
-    size_t spineSlash = spineHref.find_last_of('/');
-    std::string spineFilename = (spineSlash != std::string::npos) ? spineHref.substr(spineSlash + 1) : spineHref;
-    if (spineFilename == targetFilename) return i;
+  const std::string path = FsHelpers::decodeUriEscapes(href.substr(0, hashPos));
+  const bool validSource = sourceSpineIndex >= 0 && sourceSpineIndex < getSpineItemsCount();
+  if (path.empty()) return validSource ? sourceSpineIndex : -1;
+  // External URI schemes must never fall back to a similarly named book file.
+  if (path.find(':') != std::string::npos || path.compare(0, 2, "//") == 0) return -1;
+  const auto findExact = [this](const std::string& target) {
+    for (int i = 0; i < getSpineItemsCount(); ++i) {
+      if (getSpineItem(i).href == target) return i;
+    }
+    return -1;
+  };
+  // XHTML links are relative to the document containing them, not the OPF.
+  if (validSource && path.front() != '/') {
+    const std::string source = getSpineItem(sourceSpineIndex).href;
+    const size_t slash = source.find_last_of('/');
+    const std::string base = slash == std::string::npos ? "" : source.substr(0, slash + 1);
+    const int match = findExact(FsHelpers::normalisePath(base + path));
+    if (match >= 0) return match;
   }
-  return -1;
+  const std::string target = FsHelpers::normalisePath(path.front() == '/' ? path.substr(1) : path);
+  if (const int match = findExact(target); match >= 0) return match;
+  if (const int match = findExact(FsHelpers::normalisePath(contentBasePath + path)); match >= 0) return match;
+  // Legacy converters sometimes flatten paths. Only accept an unambiguous basename;
+  // never let an early basename match shadow a later exact path.
+  const std::string filename = target.substr(target.find_last_of('/') + 1);
+  int candidate = -1;
+  for (int i = 0; i < getSpineItemsCount(); ++i) {
+    const std::string spine = getSpineItem(i).href;
+    if (spine.substr(spine.find_last_of('/') + 1) != filename) continue;
+    if (candidate >= 0) return -1;
+    candidate = i;
+  }
+  return candidate;
 }

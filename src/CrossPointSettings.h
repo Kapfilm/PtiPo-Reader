@@ -313,6 +313,8 @@ class CrossPointSettings {
   uint8_t hideBatteryPercentage = HIDE_NEVER;
   // UI Theme
   uint8_t uiTheme = LYRA;
+  // Interface typography: 0 = original, 1 = dark, 2 = Golos Text Medium.
+  uint8_t uiFontStyle = 0;
   // Sunlight fading compensation
   uint8_t fadingFix = 0;
   // Use book's embedded CSS styles for EPUB rendering (1 = enabled, 0 = disabled)

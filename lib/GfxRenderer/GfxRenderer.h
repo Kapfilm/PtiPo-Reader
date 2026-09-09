@@ -169,6 +169,8 @@ class GfxRenderer {
   // Setup
   void begin();  // must be called right after display.begin()
   void insertFont(int fontId, EpdFontFamily font);
+  // Replace an existing family without allocating a map node. Caller holds the render lock.
+  void replaceFont(int fontId, EpdFontFamily font);
   void removeFont(int fontId) {
     fontMap.erase(fontId);
     invalidateScaledGlyphCache();

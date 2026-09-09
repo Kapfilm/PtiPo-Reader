@@ -1,4 +1,5 @@
 #pragma once
+#include "util/FootnoteHistory.h"
 
 // On-device render-benchmark harness (reader menu "Render benchmark" entry). Off by default —
 // enable with -DENABLE_BENCHMARKS=1 in a platformio.ini environment for perf investigation
@@ -501,15 +502,20 @@ class EpubReaderActivity final : public Activity {
   int footnoteListSpine_ = -1;
   int footnoteListPage_ = -1;
   int footnoteListSelectedIndex_ = 0;
-  struct SavedPosition {
-    int spineIndex;
-    int pageNumber;
-  };
-  static constexpr int MAX_FOOTNOTE_DEPTH = 3;
-  SavedPosition savedPositions[MAX_FOOTNOTE_DEPTH] = {};
-  int footnoteDepth = 0;
+  using SavedPosition = FootnoteHistory::Position;
+  FootnoteHistory footnoteHistory;
   std::string pendingFootnotePreviewAnchor;
+  std::string footnoteAnchor_;
   bool activeFootnotePreview = false;
+  // One bounded copy of the originating page's references (max 32), released on return.
+  std::vector<FootnoteEntry> originFootnotes_;
+  int originFootnoteIndex_ = 0;
+  void openFootnotes();
+  void openFootnoteMenu();
+  void openFullFootnote();
+  void switchFootnote(int delta);
+  void resetNoteRenderState();
+  void restoreNotePosition(SavedPosition position);
 
   // --- render() pass dispatch (see RenderPass) ---
   // Opportunistically restore the secondary display buffer if a prior OOM degraded it.

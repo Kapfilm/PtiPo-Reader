@@ -133,7 +133,7 @@ constexpr size_t SCT_PARSE_ARENA_BYTES = 10 * 1024;
 
 // Bump when preview expansion semantics change. This is hashed only for preview-enabled
 // variants, leaving the much more common preview-off section caches untouched.
-constexpr uint8_t INLINE_FOOTNOTE_PREVIEW_LAYOUT_VERSION = 2;
+constexpr uint8_t INLINE_FOOTNOTE_PREVIEW_LAYOUT_VERSION = 3;
 
 bool isPreviewBlockTag(const char* name) {
   static constexpr const char* tags[] = {"h1", "h2", "h3",  "h4", "h5",         "h6",
