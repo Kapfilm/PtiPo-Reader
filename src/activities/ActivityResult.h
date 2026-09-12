@@ -93,6 +93,8 @@ struct FilePathResult {
 struct StarredPageResult {
   int spineIndex = 0;
   int pageNumber = 0;
+  std::string previewAnchor;
+  bool fullNote = false;
 };
 
 struct ClippingResult {

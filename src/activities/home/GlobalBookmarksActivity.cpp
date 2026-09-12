@@ -142,6 +142,8 @@ void GlobalBookmarksActivity::openSelected() {
   jump.bookPath = entry.sourcePath;
   jump.spineIndex = bm.spineIndex;
   jump.pageNumber = bm.pageNumber;
+  jump.previewAnchor = bm.previewAnchor;
+  jump.fullNote = bm.fullNote;
   APP_STATE.saveToFile();
 
   LOG_DBG("GBA", "Jumping to bookmark in %s at %u/%u", entry.sourcePath.c_str(), bm.spineIndex, bm.pageNumber);

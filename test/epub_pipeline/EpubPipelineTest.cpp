@@ -105,6 +105,30 @@ TEST(EpubTargetedFootnotePreviewTest, StartsAtRequestedAnchorAndStopsAtPageLimit
   EXPECT_EQ(rendered.find("BEFORE"), std::string::npos);
 }
 
+TEST(EpubTargetedFootnotePreviewTest, ReflowsContinuouslyFromVerseLikeFreshPages) {
+  GfxRenderer renderer;
+  std::string verse = "<p id=\"ps112v05\">";
+  for (int i = 0; i < 100; ++i) verse += "word" + std::to_string(i) + " ";
+  verse += "</p>";
+  const auto parse = [&](const std::string& body, const std::string& anchor) {
+    std::vector<std::string> pages;
+    const std::string html = "<html><body>" + body + "</body></html>";
+    ChapterHtmlSlimParser parser(
+        nullptr, renderer, 1, 1.0f, false, 0, 120, 72, false, false, false,
+        [&](std::unique_ptr<Page> page) { pages.push_back(pageText(*page)); }, false, "", "", 0, {}, nullptr, nullptr,
+        nullptr, anchor, anchor.empty() ? 0 : 3);
+    EXPECT_TRUE(parser.setup(html.size()));
+    EXPECT_EQ(parser.write(reinterpret_cast<const uint8_t*>(html.data()), html.size()), html.size());
+    EXPECT_TRUE(parser.finalize());
+    return pages;
+  };
+  const auto normal = parse(verse, "");
+  const auto preview = parse("<p>Earlier text occupies part of the original page.</p>" + verse, "ps112v05");
+  ASSERT_GT(normal.size(), 3u);
+  ASSERT_EQ(preview.size(), 3u);
+  for (size_t i = 0; i < preview.size(); ++i) EXPECT_EQ(preview[i], normal[i]);
+}
+
 TEST(EpubTargetedFootnotePreviewTest, MissingAnchorFailsWithoutRenderingTheChapterStart) {
   GfxRenderer renderer;
   std::vector<std::unique_ptr<Page>> pages;

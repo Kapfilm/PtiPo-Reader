@@ -29,7 +29,9 @@ std::string StarredPagesActivity::getItemLabel(int index) const {
   char prefix[16];
   snprintf(prefix, sizeof(prefix), "%d. ", index + 1);
   const auto& bm = bookmarkStore.getAll()[index];
-  return std::string(prefix) + (bm.name.empty() ? getDefaultLabel(index) : bm.name);
+  return std::string(prefix) +
+         ((!bm.previewAnchor.empty() || bm.fullNote) ? std::string(tr(STR_FOOTNOTES)) + ": " : "") +
+         (bm.name.empty() ? getDefaultLabel(index) : bm.name);
 }
 
 void StarredPagesActivity::onEnter() {
@@ -91,7 +93,7 @@ void StarredPagesActivity::loop() {
     if (totalItems > 0 && ev.button == MappedInputManager::Button::Confirm &&
         ev.type == ButtonEventManager::PressType::Short) {
       const auto& bm = bookmarkStore.getAll()[selectorIndex];
-      setResult(StarredPageResult{bm.spineIndex, bm.pageNumber});
+      setResult(StarredPageResult{bm.spineIndex, bm.pageNumber, bm.previewAnchor, bm.fullNote});
       finish();
       return;
     }

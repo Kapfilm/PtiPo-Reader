@@ -416,7 +416,7 @@ void EpubReaderActivity::onEnter() {
   // A saved position of spine 0 (reading the cover/chapter 0) must NOT be overridden — the old
   // `currentSpineIndex == 0` test couldn't tell "never opened" from "saved at chapter 0" and
   // bounced the reader to the text start on every reopen at the cover.
-  if (!hadSavedProgress && currentSpineIndex == 0) {
+  if (!hadSavedProgress && currentSpineIndex == 0 && footnoteHistory.empty()) {
     int textSpineIndex = epub->getSpineIndexForTextReference();
     if (textSpineIndex != 0) {
       currentSpineIndex = textSpineIndex;
@@ -1637,27 +1637,18 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       requestUpdate();
       break;
     }
-    case EpubReaderMenuActivity::MenuAction::STAR_PAGE: {
-      if (section && section->currentPage >= 0 && section->currentPage < section->pageCount) {
-        bookmarkStore.toggle(static_cast<uint16_t>(currentSpineIndex), static_cast<uint16_t>(section->currentPage));
-        requestUpdate();
-      }
+    case EpubReaderMenuActivity::MenuAction::STAR_PAGE:
+      toggleCurrentBookmark();
       break;
-    }
     case EpubReaderMenuActivity::MenuAction::STARRED_PAGES: {
-      startActivityForResult(
-          std::make_unique<StarredPagesActivity>(renderer, mappedInput, bookmarkStore, epub),
-          [this](const ActivityResult& result) {
-            if (!result.isCancelled) {
-              const auto& starred = std::get<StarredPageResult>(result.data);
-              if (currentSpineIndex != starred.spineIndex || !section || section->currentPage != starred.pageNumber) {
-                RenderLock lock(*this);
-                currentSpineIndex = starred.spineIndex;
-                navTarget = NavigationTarget::makePage(starred.pageNumber);
-                section.reset();
-              }
-            }
-          });
+      startActivityForResult(std::make_unique<StarredPagesActivity>(renderer, mappedInput, bookmarkStore, epub),
+                             [this](const ActivityResult& result) {
+                               if (!result.isCancelled) {
+                                 const auto& starred = std::get<StarredPageResult>(result.data);
+                                 openAnnotation(starred.spineIndex, starred.pageNumber, 0, starred.previewAnchor,
+                                                starred.fullNote);
+                               }
+                             });
       break;
     }
     case EpubReaderMenuActivity::MenuAction::CREATE_CLIPPING_MARKER:
@@ -1674,22 +1665,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
                              [this](const ActivityResult& result) {
                                if (!result.isCancelled) {
                                  const auto& clipping = std::get<ClippingJumpResult>(result.data);
-                                 RenderLock lock(*this);
-                                 if (section && currentSpineIndex == clipping.spineIndex) {
-                                   int targetPage = clipping.page;
-                                   if (clipping.pageCount > 0 && clipping.pageCount != section->pageCount) {
-                                     targetPage = static_cast<int>(static_cast<uint32_t>(clipping.page) *
-                                                                   section->pageCount / clipping.pageCount);
-                                   }
-                                   targetPage = std::clamp(targetPage, 0, std::max(0, section->pageCount - 1));
-                                   section->currentPage = targetPage;
-                                   navTarget = NavigationTarget::makePage(targetPage);
-                                 } else {
-                                   currentSpineIndex = clipping.spineIndex;
-                                   navTarget = NavigationTarget::makePage(clipping.page);
-                                   navTarget.cachedPageCount = clipping.pageCount;
-                                   navTarget.cachedSpineIdx = clipping.spineIndex;
-                                   section.reset();
+                                 if (clipping.clippingIndex < clippingStore.getAll().size()) {
+                                   const auto& saved = clippingStore.getAll()[clipping.clippingIndex];
+                                   openAnnotation(clipping.spineIndex, clipping.page, clipping.pageCount,
+                                                  saved.previewAnchor, saved.fullNote);
                                  }
                                }
                                requestUpdate();
@@ -1808,13 +1787,15 @@ void EpubReaderActivity::applyPendingBookmarkJump() {
     jump.spineIndex = 0;
     jump.pageNumber = 0;
   }
-  // Seed live state directly; the persistent write is for crash recovery only.
-  // saveProgress() on the next render overwrites with the real percent.
-  currentSpineIndex = jump.spineIndex;
-  navTarget = NavigationTarget::makePage(jump.pageNumber);
-  navTarget.cachedSpineIdx = jump.spineIndex;
-  if (!writeReaderProgressCache(epub->getCachePath(), jump.spineIndex, jump.pageNumber, 0, 0)) {
-    LOG_ERR("ERS", "Failed to persist bookmark jump to progress.bin; live state still seeded");
+  if (!jump.previewAnchor.empty() || jump.fullNote) {
+    openAnnotation(jump.spineIndex, jump.pageNumber, 0, jump.previewAnchor, jump.fullNote);
+  } else {
+    currentSpineIndex = jump.spineIndex;
+    navTarget = NavigationTarget::makePage(jump.pageNumber);
+    navTarget.cachedSpineIdx = jump.spineIndex;
+    if (!writeReaderProgressCache(epub->getCachePath(), jump.spineIndex, jump.pageNumber, 0, 0)) {
+      LOG_ERR("ERS", "Failed to persist bookmark jump to progress.bin; live state still seeded");
+    }
   }
   jump.clear();
   APP_STATE.saveToFile();
@@ -4302,8 +4283,9 @@ void EpubReaderActivity::renderStatusBar() const {
     title = epub->getTitle();
   }
 
-  const bool isStarred = section && bookmarkStore.has(static_cast<uint16_t>(currentSpineIndex),
-                                                      static_cast<uint16_t>(section->currentPage));
+  const bool isStarred =
+      section && bookmarkStore.has(static_cast<uint16_t>(currentSpineIndex),
+                                   static_cast<uint16_t>(section->currentPage), annotationAnchor(), isFullNoteView());
   std::string printedPageLabel;
   if (section && SETTINGS.statusBarPrintedPage) {
     const auto page = static_cast<uint16_t>(section->currentPage);
@@ -4503,6 +4485,73 @@ void EpubReaderActivity::switchFootnote(int delta) {
   requestUpdate();
 }
 
+const std::string& EpubReaderActivity::annotationAnchor() const {
+  return isFullNoteView() ? footnoteAnchor_ : pendingFootnotePreviewAnchor;
+}
+
+void EpubReaderActivity::openAnnotation(const int spine, const int page, const int pageCount, const std::string& anchor,
+                                        const bool fullNote) {
+  RenderLock lock(*this);
+  if (!epub || spine < 0 || spine >= epub->getSpineItemsCount()) return;
+  const bool note = fullNote || !anchor.empty();
+  if (note && footnoteHistory.empty()) {
+    SavedPosition source;
+    source.spineIndex = currentSpineIndex;
+    source.pageNumber = section ? section->currentPage : navTarget.page;
+    source.pageCount = section ? section->pageCount : navTarget.cachedPageCount;
+    if (section) {
+      source.paragraph = section->getParagraphIndexForPage(section->currentPage);
+      saveProgress(currentSpineIndex, source.pageNumber, source.pageCount);
+    }
+    footnoteHistory.push(std::move(source));
+  } else if (note) {
+    footnoteHistory.keepRoot();
+  } else {
+    while (!footnoteHistory.empty()) footnoteHistory.pop();
+  }
+  resetNoteRenderState();
+  originFootnotes_.clear();
+  originFootnoteIndex_ = 0;
+  pendingFootnotePreviewAnchor = fullNote ? std::string{} : anchor;
+  footnoteAnchor_ = anchor;
+  activeFootnotePreview = false;
+  currentSpineIndex = spine;
+  navTarget = NavigationTarget::makePage(page);
+  navTarget.cachedPageCount = pageCount;
+  navTarget.cachedSpineIdx = spine;
+  section.reset();
+  requestUpdate();
+}
+
+void EpubReaderActivity::toggleCurrentBookmark() {
+  RenderLock lock(*this);
+  if (!footnoteHistory.empty() || !epub || !section || section->hasActiveBuild() || section->currentPage < 0 ||
+      section->currentPage >= section->pageCount)
+    return;
+  bookmarkStore.toggle(static_cast<uint16_t>(currentSpineIndex), static_cast<uint16_t>(section->currentPage),
+                       annotationAnchor(), isFullNoteView());
+  if (bookmarkStore.save()) {
+    GLOBAL_BOOKMARKS.syncFromStore(bookmarkStore, epub->getPath(), epub->getCachePath(), epub->getTitle(), false);
+  } else {
+    GUI.drawPopup(renderer, tr(STR_ERROR_GENERAL_FAILURE));
+    delay(900);
+  }
+  requestUpdate();
+}
+
+void EpubReaderActivity::runFootnoteAction(const uint8_t action) {
+  switch (action) {
+    case FootnoteMenuActivity::HIGHLIGHT:
+      openClipStylePicker();
+      break;
+    case FootnoteMenuActivity::DICTIONARY:
+      startClipSelection(ClippingHighlightStyle::Marker, true);
+      break;
+    default:
+      break;
+  }
+}
+
 void EpubReaderActivity::openFootnoteMenu() {
   startActivityForResult(
       std::make_unique<FootnoteMenuActivity>(renderer, mappedInput, activeFootnotePreview,
@@ -4510,6 +4559,15 @@ void EpubReaderActivity::openFootnoteMenu() {
       [this](const ActivityResult& result) {
         if (result.isCancelled || !std::holds_alternative<MenuResult>(result.data)) return;
         switch (std::get<MenuResult>(result.data).action) {
+          case FootnoteMenuActivity::HIGHLIGHT:
+            runFootnoteAction(FootnoteMenuActivity::HIGHLIGHT);
+            break;
+          case FootnoteMenuActivity::DICTIONARY:
+            runFootnoteAction(FootnoteMenuActivity::DICTIONARY);
+            break;
+          case FootnoteMenuActivity::SELECT_DICTIONARY:
+            openDictionarySelection();
+            break;
           case FootnoteMenuActivity::FULL_TEXT:
             openFullFootnote();
             break;
@@ -4769,7 +4827,7 @@ void EpubReaderActivity::openDictionarySelection() {
 }
 
 void EpubReaderActivity::startClipSelection(const ClippingHighlightStyle highlightStyle, const bool dictionaryLookup) {
-  if (!section || !epub || section->pageCount == 0) {
+  if (!section || !epub || section->pageCount == 0 || section->hasActiveBuild()) {
     requestUpdate();
     return;
   }
@@ -4949,7 +5007,7 @@ void EpubReaderActivity::startClipSelection(const ClippingHighlightStyle highlig
           const auto addResult = clippingStore.addClipping(
               static_cast<uint16_t>(currentSpineIndex), clip.sectionPage, clip.endSectionPage, clip.sectionPageCount,
               clip.startPageWordIndex, clip.endPageWordIndex, clip.wordCount, chapterTitle.c_str(), clip.paragraphIndex,
-              clip.text, highlightStyle);
+              clip.text, highlightStyle, annotationAnchor(), isFullNoteView());
           const bool exported = addResult == ClippingStore::AddResult::Added &&
                                 ClippingsManager::appendKindleExport(epub->getTitle(), epub->getAuthor(), chapterTitle,
                                                                      static_cast<int>(clip.sectionPage) + 1, clip.text);
@@ -4974,7 +5032,8 @@ void EpubReaderActivity::drawClippingHighlights(const Page& page, const int font
     current = 0;
     next = 0;
     for (const Clipping& clipping : clippingStore.getAll()) {
-      if (clipping.spineIndex != static_cast<uint16_t>(currentSpineIndex) || clipping.pageCount != currentPageCount ||
+      if (clipping.previewAnchor != annotationAnchor() || clipping.fullNote != isFullNoteView() ||
+          clipping.spineIndex != static_cast<uint16_t>(currentSpineIndex) || clipping.pageCount != currentPageCount ||
           currentPage < clipping.startPage || currentPage > clipping.endPage) {
         continue;
       }
@@ -5104,8 +5163,9 @@ void EpubReaderActivity::openReaderMenu() {
     bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
   }
   const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
-  const bool isCurrentPageStarred = section && bookmarkStore.has(static_cast<uint16_t>(currentSpineIndex),
-                                                                 static_cast<uint16_t>(section->currentPage));
+  const bool isCurrentPageStarred =
+      section && bookmarkStore.has(static_cast<uint16_t>(currentSpineIndex),
+                                   static_cast<uint16_t>(section->currentPage), annotationAnchor(), isFullNoteView());
 
   // Show the "Go to printed page" item only when this book has at least one integer-labelled
   // entry in pagelist.bin. Roman-only or empty page lists are excluded — the numeric input
@@ -5145,6 +5205,15 @@ void EpubReaderActivity::onButtonAction(const CrossPointSettings::BUTTON_ACTION 
   using BA = CrossPointSettings::BUTTON_ACTION;
   if (!footnoteHistory.empty()) {
     switch (action) {
+      case BA::BTN_CREATE_CLIPPING:
+        runFootnoteAction(FootnoteMenuActivity::HIGHLIGHT);
+        return;
+      case BA::BTN_DICTIONARY_LOOKUP:
+        runFootnoteAction(FootnoteMenuActivity::DICTIONARY);
+        return;
+      case BA::BTN_DICTIONARY_SELECT:
+        openDictionarySelection();
+        return;
       case BA::BTN_PAGE_FORWARD:
         pageTurn(true);
         return;
@@ -5185,10 +5254,7 @@ void EpubReaderActivity::onButtonAction(const CrossPointSettings::BUTTON_ACTION 
       requestUpdate();
       break;
     case BA::BTN_STAR_PAGE:
-      if (section) {
-        bookmarkStore.toggle(static_cast<uint16_t>(currentSpineIndex), static_cast<uint16_t>(section->currentPage));
-        requestUpdate();
-      }
+      toggleCurrentBookmark();
       break;
     case BA::BTN_FOOTNOTES:
       openFootnotes();

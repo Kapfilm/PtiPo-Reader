@@ -312,7 +312,7 @@ class CrossPointSettings {
   // Hide battery percentage
   uint8_t hideBatteryPercentage = HIDE_NEVER;
   // UI Theme
-  uint8_t uiTheme = LYRA;
+  uint8_t uiTheme = MINIMAL;
   // Interface typography: 0 = original, 1 = dark, 2 = Golos Text Medium.
   uint8_t uiFontStyle = 0;
   // Sunlight fading compensation

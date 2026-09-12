@@ -11,7 +11,7 @@
 #include <cstring>
 
 namespace {
-constexpr uint8_t FILE_VERSION = 3;
+constexpr uint8_t FILE_VERSION = 4;
 constexpr size_t LEGACY_CHAPTER_TITLE_MAX = 48;
 constexpr size_t INITIAL_RESERVE = 4;
 constexpr char CLIPPINGS_DIR[] = "/.crosspoint/clippings";
@@ -35,9 +35,9 @@ bool writePodChecked(FsFile& file, const T& value) {
   return file.write(reinterpret_cast<const uint8_t*>(&value), sizeof(value)) == sizeof(value);
 }
 
-bool readStringChecked(FsFile& file, std::string& value) {
+bool readStringChecked(FsFile& file, std::string& value, const size_t maximum = serialization::MAX_STRING_LENGTH) {
   uint32_t length = 0;
-  if (!readPodChecked(file, length) || length > serialization::MAX_STRING_LENGTH) return false;
+  if (!readPodChecked(file, length) || length > maximum) return false;
   value.resize(length);
   return length == 0 || file.read(reinterpret_cast<uint8_t*>(value.data()), length) == static_cast<int>(length);
 }
@@ -72,10 +72,15 @@ ClippingStore::AddResult ClippingStore::addClipping(const uint16_t spineIndex, c
                                                     const uint16_t startWordIndex, const uint16_t endWordIndex,
                                                     const uint16_t wordCount, const char* chapterTitle,
                                                     const uint16_t paragraphIndex, const std::string& text,
-                                                    const ClippingHighlightStyle highlightStyle) {
+                                                    const ClippingHighlightStyle highlightStyle,
+                                                    const std::string& previewAnchor, const bool fullNote) {
+  // Reject oversized identities rather than truncate into a different, valid anchor.
+  if (previewAnchor.size() > CLIPPING_PREVIEW_ANCHOR_MAX) return AddResult::SaveFailed;
   if (clippings.size() >= CLIPPING_MAX_PER_BOOK) return AddResult::LimitReached;
 
   Clipping clipping;
+  clipping.previewAnchor = previewAnchor;
+  clipping.fullNote = fullNote;
   clipping.spineIndex = spineIndex;
   clipping.startPage = startPage;
   clipping.endPage = endPage;
@@ -183,6 +188,22 @@ bool ClippingStore::readFromFile() {
       file.close();
       return false;
     }
+    if (version >= 4 && !readStringChecked(file, clipping.previewAnchor, CLIPPING_PREVIEW_ANCHOR_MAX)) {
+      LOG_ERR("CLIP", "Invalid clipping preview anchor at record %u", i);
+      clippings.clear();
+      file.close();
+      return false;
+    }
+    if (version >= 4) {
+      uint8_t fullNote = 0;
+      if (!readPodChecked(file, fullNote) || fullNote > 1) {
+        LOG_ERR("CLIP", "Invalid clipping note context at record %u", i);
+        clippings.clear();
+        file.close();
+        return false;
+      }
+      clipping.fullNote = fullNote != 0;
+    }
     if (clipping.text.size() > CLIPPING_TEXT_MAX) clipping.text.resize(CLIPPING_TEXT_MAX);
     clippings.push_back(std::move(clipping));
   }
@@ -216,7 +237,10 @@ bool ClippingStore::writeToFile() const {
          writePodChecked(file, clipping.startWordIndex) && writePodChecked(file, clipping.endWordIndex) &&
          writePodChecked(file, clipping.wordCount) && writePodChecked(file, clipping.paragraphIndex) &&
          writePodChecked(file, clipping.timestamp) && writePodChecked(file, highlightStyle) &&
-         writeStringChecked(file, clipping.chapterTitle) && writeStringChecked(file, clipping.text);
+         writeStringChecked(file, clipping.chapterTitle) && writeStringChecked(file, clipping.text) &&
+         clipping.previewAnchor.size() <= CLIPPING_PREVIEW_ANCHOR_MAX &&
+         writeStringChecked(file, clipping.previewAnchor) &&
+         writePodChecked(file, static_cast<uint8_t>(clipping.fullNote));
     if (!ok) break;
   }
   if (ok) file.flush();

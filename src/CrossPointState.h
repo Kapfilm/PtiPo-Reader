@@ -29,9 +29,14 @@ struct PendingBookmarkJumpState {
   uint16_t spineIndex = 0;  // EPUB spine; ignored for TXT
   uint16_t pageNumber = 0;  // page within spine (EPUB) or global page (TXT)
 
+  std::string previewAnchor;
+  bool fullNote = false;
+
   void clear() {
     active = false;
     bookPath.clear();
+    previewAnchor.clear();
+    fullNote = false;
     spineIndex = 0;
     pageNumber = 0;
   }

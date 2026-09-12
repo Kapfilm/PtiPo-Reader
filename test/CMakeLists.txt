@@ -82,3 +82,5 @@ add_subdirectory(epub_pipeline)
 add_subdirectory(memory_arena)
 add_subdirectory(content_bin)
 add_subdirectory(preview_block_locator)
+
+add_subdirectory(clipping_store)

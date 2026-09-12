@@ -122,6 +122,8 @@ bool JsonSettingsIO::saveState(const CrossPointState& s, const char* path) {
   jump["bookPath"] = s.pendingBookmarkJump.bookPath;
   jump["spineIndex"] = s.pendingBookmarkJump.spineIndex;
   jump["pageNumber"] = s.pendingBookmarkJump.pageNumber;
+  jump["previewAnchor"] = s.pendingBookmarkJump.previewAnchor;
+  jump["fullNote"] = s.pendingBookmarkJump.fullNote;
 
   if (doc.overflowed()) {
     LOG_ERR("CPS", "JSON document overflowed while building state");
@@ -186,6 +188,13 @@ bool JsonSettingsIO::loadState(CrossPointState& s, const char* json) {
   s.pendingBookmarkJump.bookPath = jump["bookPath"] | std::string("");
   s.pendingBookmarkJump.spineIndex = jump["spineIndex"] | (uint16_t)0;
   s.pendingBookmarkJump.pageNumber = jump["pageNumber"] | (uint16_t)0;
+  s.pendingBookmarkJump.fullNote = jump["fullNote"] | false;
+  const char* previewAnchor = jump["previewAnchor"] | "";
+  if (strlen(previewAnchor) <= 191) {
+    s.pendingBookmarkJump.previewAnchor = previewAnchor;
+  } else {
+    s.pendingBookmarkJump.clear();
+  }
   return true;
 }
 

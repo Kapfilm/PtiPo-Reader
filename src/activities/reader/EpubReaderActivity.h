@@ -512,6 +512,11 @@ class EpubReaderActivity final : public Activity {
   int originFootnoteIndex_ = 0;
   void openFootnotes();
   void openFootnoteMenu();
+  void runFootnoteAction(uint8_t action);
+  void toggleCurrentBookmark();
+  const std::string& annotationAnchor() const;
+  bool isFullNoteView() const { return !footnoteHistory.empty() && pendingFootnotePreviewAnchor.empty(); }
+  void openAnnotation(int spine, int page, int pageCount, const std::string& anchor, bool fullNote);
   void openFullFootnote();
   void switchFootnote(int delta);
   void resetNoteRenderState();

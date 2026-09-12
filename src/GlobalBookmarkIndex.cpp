@@ -17,9 +17,10 @@ void writeString(FsFile& f, const std::string& s) {
   }
 }
 
-bool readString(FsFile& f, std::string& out) {
+bool readString(FsFile& f, std::string& out, uint16_t maxLength = UINT16_MAX) {
   uint16_t len = 0;
   if (f.read(reinterpret_cast<uint8_t*>(&len), sizeof(len)) != sizeof(len)) return false;
+  if (len > maxLength) return false;
   out.clear();
   if (len == 0) return true;
   out.resize(len);
@@ -46,7 +47,7 @@ void GlobalBookmarkIndex::load() {
   }
 
   uint8_t version = 0;
-  if (f.read(&version, 1) != 1 || version != FILE_VERSION) {
+  if (f.read(&version, 1) != 1 || version < 1 || version > FILE_VERSION) {
     LOG_ERR("GBI", "Bad version: %u", version);
     f.close();
     return;
@@ -86,11 +87,21 @@ void GlobalBookmarkIndex::load() {
       BookmarkStore::Bookmark bm;
       if (f.read(reinterpret_cast<uint8_t*>(&bm.spineIndex), sizeof(bm.spineIndex)) != sizeof(bm.spineIndex) ||
           f.read(reinterpret_cast<uint8_t*>(&bm.pageNumber), sizeof(bm.pageNumber)) != sizeof(bm.pageNumber) ||
-          !readString(f, bm.name)) {
+          !readString(f, bm.name, BookmarkStore::MAX_NAME_LENGTH) ||
+          (version >= 2 && !readString(f, bm.previewAnchor, BookmarkStore::MAX_PREVIEW_ANCHOR_LENGTH))) {
         LOG_ERR("GBI", "Truncated bookmark");
         entries.clear();
         f.close();
         return;
+      }
+      if (version >= 2) {
+        uint8_t fullNote = 0;
+        if (f.read(&fullNote, 1) != 1 || fullNote > 1) {
+          entries.clear();
+          f.close();
+          return;
+        }
+        bm.fullNote = fullNote != 0;
       }
       e.bookmarks.push_back(std::move(bm));
     }
@@ -126,6 +137,9 @@ void GlobalBookmarkIndex::save() const {
       f.write(reinterpret_cast<const uint8_t*>(&bm.spineIndex), sizeof(bm.spineIndex));
       f.write(reinterpret_cast<const uint8_t*>(&bm.pageNumber), sizeof(bm.pageNumber));
       writeString(f, bm.name);
+      writeString(f, bm.previewAnchor);
+      const uint8_t fullNote = bm.fullNote ? 1 : 0;
+      f.write(&fullNote, 1);
     }
   }
   f.close();
